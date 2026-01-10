@@ -13,7 +13,7 @@ const NEZHA_SERVER = process.env.NEZHA_SERVER || '';       // 哪吒v1填写形�
 const NEZHA_PORT = process.env.NEZHA_PORT || '';           // 哪吒v1没有此变量，v0的agent端口为{443,8443,2096,2087,2083,2053}其中之一时开启tls
 const NEZHA_KEY = process.env.NEZHA_KEY || '';             // v1的NZ_CLIENT_SECRET或v0的agent端口                
 const DOMAIN = process.env.DOMAIN || 'https://mooninc-moonlabs.hf.space';       // 填写项目域名或已反代的域名，不带前缀，例如：abc-domain.com
-const AUTO_ACCESS = process.env.AUTO_ACCESS || true;       // 是否开启自动访问保活,false为关闭,true为开启,需同时填写DOMAIN变量
+const AUTO_ACCESS = (process.env.AUTO_ACCESS ?? 'true').toLowerCase() !== 'false';       // 是否开启自动访问保活,false为关闭,true为开启,需同时填写DOMAIN变量
 const WSPATH = process.env.WSPATH || UUID.slice(0, 8);     // 节点路径，默认获取uuid前8位
 const SUB_PATH = process.env.SUB_PATH || 'sub';            // 获取节点的订阅路径
 const NAME = process.env.NAME || 'MAX-1';                       // 节点名称
@@ -22,7 +22,7 @@ const PORT = process.env.PORT || 8443;                     // http和ws服务端
 let ISP = '';
 const GetISP = async () => {
   try {
-    const res = await axios.get('https://api.ip.sb/geoip');
+    const res = await axios.get('https://api.ip.sb/geoip', { timeout: 5000 });
     const data = res.data;
     ISP = `${data.country_code}-${data.isp}`.replace(/ /g, '_');
   } catch (e) {
@@ -61,47 +61,59 @@ const httpServer = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server: httpServer });
 const uuid = UUID.replace(/-/g, "");
-const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
+const DNS_RESOLVERS = [
+  'https://dns.google/resolve',
+  'https://cloudflare-dns.com/dns-query'
+];
+const IPV4_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+
 // Custom DNS
-function resolveHost(host) {
-  return new Promise((resolve, reject) => {
-    if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
-      resolve(host);
-      return;
-    }
-    let attempts = 0;
-    function tryNextDNS() {
-      if (attempts >= DNS_SERVERS.length) {
-        reject(new Error(`Failed to resolve ${host} with all DNS servers`));
-        return;
-      }
-      const dnsServer = DNS_SERVERS[attempts];
-      attempts++;
-      const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
-      axios.get(dnsQuery, {
+async function resolveHost(host) {
+  if (IPV4_REGEX.test(host)) {
+    return host;
+  }
+
+  for (const resolver of DNS_RESOLVERS) {
+    const dnsQuery = `${resolver}?name=${encodeURIComponent(host)}&type=A`;
+    try {
+      const response = await axios.get(dnsQuery, {
         timeout: 5000,
         headers: {
           'Accept': 'application/dns-json'
         }
-      })
-      .then(response => {
-        const data = response.data;
-        if (data.Status === 0 && data.Answer && data.Answer.length > 0) {
-          const ip = data.Answer.find(record => record.type === 1);
-          if (ip) {
-            resolve(ip.data);
-            return;
-          }
-        }
-        tryNextDNS();
-      })
-      .catch(error => {
-        tryNextDNS();
       });
+      const data = response.data;
+      if (data.Status === 0 && data.Answer && data.Answer.length > 0) {
+        const ip = data.Answer.find(record => record.type === 1);
+        if (ip) {
+          return ip.data;
+        }
+      }
+    } catch (error) {
+      // try next resolver
     }
-    
-    tryNextDNS();
+  }
+
+  throw new Error(`Failed to resolve ${host} with all DNS resolvers`);
+}
+
+function connectWithFallback(ws, host, port, initialData) {
+  const duplex = createWebSocketStream(ws);
+  const connect = (targetHost) => new Promise((resolve, reject) => {
+    const socket = net.connect({ host: targetHost, port }, function() {
+      if (initialData && initialData.length) {
+        this.write(initialData);
+      }
+      duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
+      resolve();
+    });
+    socket.on('error', reject);
   });
+
+  resolveHost(host)
+    .then(resolvedIP => connect(resolvedIP))
+    .catch(() => connect(host))
+    .catch(() => {});
 }
 
 // VLE-SS处理
@@ -117,21 +129,8 @@ function handleVlessConnection(ws, msg) {
     (ATYP == 2 ? new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8())) :
     (ATYP == 3 ? msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':') : ''));
   ws.send(new Uint8Array([VERSION, 0]));
-  const duplex = createWebSocketStream(ws);
-  resolveHost(host)
-    .then(resolvedIP => {
-      net.connect({ host: resolvedIP, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    })
-    .catch(error => {
-      net.connect({ host, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    });
-  
+  connectWithFallback(ws, host, port, msg.slice(i));
+  
   return true;
 }
 
@@ -189,26 +188,9 @@ function handleTrojanConnection(ws, msg) {
       offset += 2;
     }
     
-    const duplex = createWebSocketStream(ws);
-
-    resolveHost(host)
-      .then(resolvedIP => {
-        net.connect({ host: resolvedIP, port }, function() {
-          if (offset < msg.length) {
-            this.write(msg.slice(offset));
-          }
-          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
-      })
-      .catch(error => {
-        net.connect({ host, port }, function() {
-          if (offset < msg.length) {
-            this.write(msg.slice(offset));
-          }
-          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
-      });
-    
+    const initialData = offset < msg.length ? msg.slice(offset) : null;
+    connectWithFallback(ws, host, port, initialData);
+   
     return true;
   } catch (error) {
     return false;
