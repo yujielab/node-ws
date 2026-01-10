@@ -2,6 +2,7 @@ const os = require('os');
 const http = require('http');
 const fs = require('fs');
 const axios = require('axios');
+const dns = require('dns');
 const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
@@ -59,49 +60,106 @@ const httpServer = http.createServer((req, res) => {
   }
 });
 
-const wss = new WebSocket.Server({ server: httpServer });
+const wss = new WebSocket.Server({
+  server: httpServer,
+  perMessageDeflate: false
+});
 const uuid = UUID.replace(/-/g, "");
 const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
+dns.setDefaultResultOrder('ipv4first');
+const dnsCache = new Map();
+const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+const DNS_TIMEOUT_MS = 2000;
 // Custom DNS
-function resolveHost(host) {
+function withTimeout(promise, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
-      resolve(host);
-      return;
-    }
-    let attempts = 0;
-    function tryNextDNS() {
-      if (attempts >= DNS_SERVERS.length) {
-        reject(new Error(`Failed to resolve ${host} with all DNS servers`));
-        return;
-      }
-      const dnsServer = DNS_SERVERS[attempts];
-      attempts++;
-      const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
-      axios.get(dnsQuery, {
-        timeout: 5000,
-        headers: {
-          'Accept': 'application/dns-json'
-        }
+    const timer = setTimeout(() => reject(new Error('DNS timeout')), timeoutMs);
+    promise
+      .then(value => {
+        clearTimeout(timer);
+        resolve(value);
       })
+      .catch(err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+function firstResolved(promises, errorMessage) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let pending = promises.length;
+    const errors = [];
+    promises.forEach(promise => {
+      Promise.resolve(promise)
+        .then(value => {
+          if (done) return;
+          done = true;
+          resolve(value);
+        })
+        .catch(err => {
+          errors.push(err);
+          pending -= 1;
+          if (pending === 0 && !done) {
+            reject(new Error(errorMessage));
+          }
+        });
+    });
+  });
+}
+
+function resolveHostViaDoH(host) {
+  let attempts = 0;
+  function tryNextDNS() {
+    if (attempts >= DNS_SERVERS.length) {
+      return Promise.reject(new Error(`Failed to resolve ${host} with all DNS servers`));
+    }
+    attempts++;
+    const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
+    return axios.get(dnsQuery, {
+      timeout: DNS_TIMEOUT_MS,
+      headers: {
+        'Accept': 'application/dns-json'
+      }
+    })
       .then(response => {
         const data = response.data;
         if (data.Status === 0 && data.Answer && data.Answer.length > 0) {
           const ip = data.Answer.find(record => record.type === 1);
           if (ip) {
-            resolve(ip.data);
-            return;
+            return ip.data;
           }
         }
-        tryNextDNS();
+        return tryNextDNS();
       })
-      .catch(error => {
-        tryNextDNS();
-      });
-    }
-    
-    tryNextDNS();
-  });
+      .catch(() => tryNextDNS());
+  }
+
+  return tryNextDNS();
+}
+
+async function resolveHost(host) {
+  if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
+    return host;
+  }
+
+  const cached = dnsCache.get(host);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.ip;
+  }
+
+  const systemLookup = withTimeout(
+    dns.promises.lookup(host, { family: 4 }).then(result => result.address),
+    DNS_TIMEOUT_MS
+  );
+  const dohLookup = resolveHostViaDoH(host);
+  const resolvedIP = await firstResolved(
+    [systemLookup, dohLookup],
+    `Failed to resolve ${host} with all DNS servers`
+  );
+  dnsCache.set(host, { ip: resolvedIP, expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+  return resolvedIP;
 }
 
 // VLE-SS处理
@@ -120,18 +178,24 @@ function handleVlessConnection(ws, msg) {
   const duplex = createWebSocketStream(ws);
   resolveHost(host)
     .then(resolvedIP => {
-      net.connect({ host: resolvedIP, port }, function() {
+      const socket = net.connect({ host: resolvedIP, port }, function() {
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 10000);
         this.write(msg.slice(i));
         duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
+      });
+      socket.on('error', () => {});
     })
     .catch(error => {
-      net.connect({ host, port }, function() {
+      const socket = net.connect({ host, port }, function() {
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 10000);
         this.write(msg.slice(i));
         duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
+      });
+      socket.on('error', () => {});
     });
-  
+  
   return true;
 }
 
@@ -193,20 +257,26 @@ function handleTrojanConnection(ws, msg) {
 
     resolveHost(host)
       .then(resolvedIP => {
-        net.connect({ host: resolvedIP, port }, function() {
+        const socket = net.connect({ host: resolvedIP, port }, function() {
+          socket.setNoDelay(true);
+          socket.setKeepAlive(true, 10000);
           if (offset < msg.length) {
             this.write(msg.slice(offset));
           }
           duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
+        });
+        socket.on('error', () => {});
       })
       .catch(error => {
-        net.connect({ host, port }, function() {
+        const socket = net.connect({ host, port }, function() {
+          socket.setNoDelay(true);
+          socket.setKeepAlive(true, 10000);
           if (offset < msg.length) {
             this.write(msg.slice(offset));
           }
           duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
+        });
+        socket.on('error', () => {});
       });
     
     return true;
@@ -216,6 +286,10 @@ function handleTrojanConnection(ws, msg) {
 }
 // Ws 连接处理
 wss.on('connection', (ws, req) => {
+  if (ws._socket) {
+    ws._socket.setNoDelay(true);
+    ws._socket.setKeepAlive(true, 10000);
+  }
   const url = req.url || '';
   ws.once('message', msg => {
     if (msg.length > 17 && msg[0] === 0) {
